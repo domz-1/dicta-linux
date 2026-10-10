@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dicta Linux - Smart Real-Time Bilingual Speech-to-Text & Voice Typing
+Dicta Linux - Real-Time Live Speech-to-Text with Floating Live HUD Overlay
 Author: Adham (@domz-1)
 License: MIT
 """
@@ -8,7 +8,7 @@ License: MIT
 import sys
 import os
 import time
-import argparse
+import threading
 import subprocess
 import urllib.request
 import urllib.parse
@@ -20,47 +20,24 @@ import struct
 import math
 import re
 
-PID_FILE = "/tmp/dicta_live.pid"
-AUDIO_DUMP = "/tmp/dicta_dump.wav"
+os.environ["DISPLAY"] = os.environ.get("DISPLAY", ":0")
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Pango
+
+PID_FILE = "/tmp/dicta_gui.pid"
 SOUND_START = "/usr/share/sounds/freedesktop/stereo/message.oga"
 SOUND_DONE = "/usr/share/sounds/freedesktop/stereo/complete.oga"
-
-os.environ["DISPLAY"] = os.environ.get("DISPLAY", ":0")
 
 WHISPER_CLI = "/home/adham/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = "/home/adham/whisper.cpp/models/ggml-base.bin"
 
 def play_sound(sound_path):
     if os.path.exists(sound_path):
-        try:
-            subprocess.Popen(["paplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
-def is_running():
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            return pid
-        except Exception:
-            try: os.remove(PID_FILE)
-            except Exception: pass
-    return None
-
-def stop_live():
-    pid = is_running()
-    if pid:
-        try: os.kill(pid, signal.SIGTERM)
+        try: subprocess.Popen(["paplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception: pass
-        try: os.remove(PID_FILE)
-        except Exception: pass
-        subprocess.run(["pkill", "-f", "parec.*dicta"], stderr=subprocess.DEVNULL)
-        play_sound("/usr/share/sounds/freedesktop/stereo/dialog-information.oga")
-        subprocess.run(["notify-send", "-u", "low", "-i", "audio-volume-muted", "Dicta", "⏹️ Voice typing stopped."])
-        return True
-    return False
 
 def pcm_to_flac(pcm_data, sample_rate=16000):
     wav_io = io.BytesIO()
@@ -86,7 +63,7 @@ def transcribe_google(flac_bytes, lang="ar-EG"):
         headers={"Content-Type": "audio/x-flac; rate=16000", "User-Agent": "Mozilla/5.0"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=6) as res:
+        with urllib.request.urlopen(req, timeout=5) as res:
             raw = res.read().decode("utf-8")
             lines = [l.strip() for l in raw.split("\n") if l.strip()]
             for line in lines:
@@ -113,10 +90,9 @@ def transcribe_whisper(pcm_data):
                 wf.setsampwidth(2)
                 wf.setframerate(16000)
                 wf.writeframes(pcm_data)
-        
         try:
             cmd = [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", wav_path, "-l", "auto", "--no-timestamps", "-nt"]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=7)
             lines = res.stdout.strip().splitlines()
             text = " ".join(line.strip() for line in lines if line.strip() and not line.startswith("[") and not line.startswith("whisper_"))
             text = re.sub(r'\[\d+:\d+:\d+\.\d+ --> \d+:\d+:\d+\.\d+\]', '', text).strip()
@@ -128,82 +104,183 @@ def transcribe_whisper(pcm_data):
             except Exception: pass
     return ""
 
-def transcribe_bytes(pcm_data, lang="ar-EG"):
+def transcribe_chunk(pcm_data, lang="ar-EG"):
     flac_bytes = pcm_to_flac(pcm_data)
     text = ""
-    if flac_bytes and len(flac_bytes) > 1000:
+    if flac_bytes and len(flac_bytes) > 800:
         text = transcribe_google(flac_bytes, lang=lang)
         if not text and lang != "en-US":
             text = transcribe_google(flac_bytes, lang="en-US")
-
     if not text:
         text = transcribe_whisper(pcm_data)
-
     return text.strip()
 
 def paste_text(text):
     try:
         p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         p.communicate(input=text.encode("utf-8"))
-    except Exception:
-        pass
+    except Exception: pass
     try:
         p = subprocess.Popen(["xclip", "-selection", "primary"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         p.communicate(input=text.encode("utf-8"))
-    except Exception:
-        pass
+    except Exception: pass
 
     subprocess.run(["copyq", "copy", text], stderr=subprocess.DEVNULL)
     time.sleep(0.08)
     subprocess.run(["copyq", "paste"], stderr=subprocess.DEVNULL)
 
-def live_dictate(lang="ar-EG", continuous=False):
-    # If already running -> user pressed shortcut a 2nd time to force stop & transcribe!
-    if is_running():
-        stop_live()
-        return
+class LiveSpeechHUD(Gtk.Window):
+    def __init__(self, lang="ar-EG"):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.lang = lang
+        self.running = True
+        self.transcribed_words = []
+        self.current_live_text = "Listening... Speak now in Arabic or English"
 
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+        self.set_title("Dicta Live Voice Typing")
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_app_paintable(True)
+        self.set_default_size(560, 90)
+        self.set_position(Gtk.WindowPosition.CENTER)
 
-    play_sound(SOUND_START)
-    subprocess.run([
-        "notify-send", "-u", "normal",
-        "-i", "audio-input-microphone",
-        "🎙️ Dicta - Listening...",
-        "Speak in Arabic or English now!\n(Stops and pastes automatically when you pause)"
-    ])
+        # Apply Modern Dark CSS Style
+        css = b"""
+        window {
+            background-color: rgba(24, 24, 27, 0.94);
+            border-radius: 20px;
+            border: 2px solid rgba(59, 130, 246, 0.8);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
+        }
+        label#status {
+            color: #60a5fa;
+            font-size: 13px;
+            font-weight: bold;
+        }
+        label#live_text {
+            color: #f8fafc;
+            font-size: 16px;
+            font-weight: 500;
+        }
+        button#done_btn {
+            background: linear-gradient(135deg, #2563eb, #1d4ed8);
+            color: white;
+            border-radius: 12px;
+            font-weight: bold;
+            padding: 6px 14px;
+            border: none;
+        }
+        button#done_btn:hover {
+            background: #3b82f6;
+        }
+        button#cancel_btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #cbd5e1;
+            border-radius: 12px;
+            padding: 6px 12px;
+            border: none;
+        }
+        button#cancel_btn:hover {
+            background: rgba(239, 68, 68, 0.4);
+            color: white;
+        }
+        """
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
-    proc = subprocess.Popen(
-        ["parec", "--rate=16000", "--channels=1", "--format=s16le"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
+        # Layout Container
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        main_box.set_margin_top(12)
+        main_box.set_margin_bottom(12)
+        main_box.set_margin_start(18)
+        main_box.set_margin_end(18)
 
-    CHUNK_MS = 50
-    CHUNK_BYTES = int(16000 * 2 * (CHUNK_MS / 1000)) # 1600 bytes
-    SILENCE_LIMIT = int(700 / CHUNK_MS) # 0.7s silence
-    MAX_FRAMES = int(18000 / CHUNK_MS)
+        # Header bar with Status & Controls
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.mic_icon = Gtk.Label(label="🎙️ 🔴")
+        self.status_lbl = Gtk.Label(label="Live Voice Typing (Arabic + English)")
+        self.status_lbl.set_name("status")
 
-    # Ambient noise calibration
-    ambient = []
-    for _ in range(4):
-        raw = proc.stdout.read(CHUNK_BYTES)
-        if not raw: break
-        count = len(raw) // 2
-        shorts = struct.unpack(f"{count}h", raw)
-        ambient.append(int(math.sqrt(sum(s * s for s in shorts) / count)))
+        cancel_btn = Gtk.Button(label="✕ Cancel")
+        cancel_btn.set_name("cancel_btn")
+        cancel_btn.connect("clicked", self.on_cancel)
 
-    base_noise = max(30, sum(ambient) // len(ambient) if ambient else 70)
-    SPEECH_THRESHOLD = max(120, int(base_noise * 1.35))
+        done_btn = Gtk.Button(label="✓ Insert (Enter)")
+        done_btn.set_name("done_btn")
+        done_btn.connect("clicked", self.on_done)
 
-    is_speaking = False
-    speech_buffer = bytearray()
-    silence_count = 0
-    total_frames = 0
+        header_box.pack_start(self.mic_icon, False, False, 0)
+        header_box.pack_start(self.status_lbl, False, False, 0)
+        header_box.pack_end(done_btn, False, False, 0)
+        header_box.pack_end(cancel_btn, False, False, 0)
 
-    try:
-        while os.path.exists(PID_FILE):
+        # Live Text Display
+        self.text_label = Gtk.Label(label=self.current_live_text)
+        self.text_label.set_name("live_text")
+        self.text_label.set_line_wrap(True)
+        self.text_label.set_max_width_chars(50)
+        self.text_label.set_alignment(0.0, 0.5)
+
+        main_box.pack_start(header_box, False, False, 0)
+        main_box.pack_start(self.text_label, True, True, 4)
+
+        self.add(main_box)
+        self.connect("key-press-event", self.on_key_press)
+        self.show_all()
+
+        play_sound(SOUND_START)
+
+        # Start audio capture thread
+        self.thread = threading.Thread(target=self.audio_loop, daemon=True)
+        self.thread.start()
+
+    def on_key_press(self, widget, event):
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.on_done()
+            return True
+        elif event.keyval == Gdk.KEY_Escape:
+            self.on_cancel()
+            return True
+        return False
+
+    def update_ui_text(self, text):
+        self.text_label.set_text(text)
+
+    def audio_loop(self):
+        proc = subprocess.Popen(
+            ["parec", "--rate=16000", "--channels=1", "--format=s16le"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+
+        CHUNK_MS = 50
+        CHUNK_BYTES = int(16000 * 2 * (CHUNK_MS / 1000)) # 1600 bytes
+        SILENCE_LIMIT = int(800 / CHUNK_MS) # 0.8s silence triggers phrase commit
+
+        # Calibrate
+        ambient = []
+        for _ in range(4):
+            raw = proc.stdout.read(CHUNK_BYTES)
+            if not raw: break
+            count = len(raw) // 2
+            shorts = struct.unpack(f"{count}h", raw)
+            ambient.append(int(math.sqrt(sum(s * s for s in shorts) / count)))
+        
+        base_noise = max(30, sum(ambient) // len(ambient) if ambient else 70)
+        THRESHOLD = max(110, int(base_noise * 1.35))
+
+        speech_buffer = bytearray()
+        is_speaking = False
+        silence_count = 0
+
+        while self.running:
             raw = proc.stdout.read(CHUNK_BYTES)
             if not raw: break
 
@@ -211,10 +288,11 @@ def live_dictate(lang="ar-EG", continuous=False):
             shorts = struct.unpack(f"{count}h", raw)
             rms = int(math.sqrt(sum(s * s for s in shorts) / count))
 
-            if rms >= SPEECH_THRESHOLD:
+            if rms >= THRESHOLD:
                 if not is_speaking:
                     is_speaking = True
                     silence_count = 0
+                    GLib.idle_add(self.mic_icon.set_text, "🎙️ 🟢")
                 speech_buffer.extend(raw)
                 silence_count = 0
             else:
@@ -222,68 +300,72 @@ def live_dictate(lang="ar-EG", continuous=False):
                     speech_buffer.extend(raw)
                     silence_count += 1
                     if silence_count >= SILENCE_LIMIT:
+                        # Process spoken phrase
+                        GLib.idle_add(self.mic_icon.set_text, "🎙️ ⏳")
                         if len(speech_buffer) >= CHUNK_BYTES * 5:
-                            text = transcribe_bytes(bytes(speech_buffer), lang=lang)
+                            text = transcribe_chunk(bytes(speech_buffer), lang=self.lang)
                             if text:
-                                paste_text(text + " ")
-                                play_sound(SOUND_DONE)
-                                subprocess.run(["notify-send", "-u", "low", "-i", "emblem-default", "✨ Dicta", text])
-
+                                self.transcribed_words.append(text)
+                                full_sentence = " ".join(self.transcribed_words)
+                                GLib.idle_add(self.update_ui_text, full_sentence)
+                        
                         speech_buffer = bytearray()
                         is_speaking = False
                         silence_count = 0
+                        GLib.idle_add(self.mic_icon.set_text, "🎙️ 🔴")
 
-                        if not continuous:
-                            break
-
-            total_frames += 1
-            if total_frames >= MAX_FRAMES and is_speaking:
-                text = transcribe_bytes(bytes(speech_buffer), lang=lang)
-                if text:
-                    paste_text(text + " ")
-                    play_sound(SOUND_DONE)
-                break
-
-    finally:
         try: proc.terminate()
         except Exception: pass
-        try:
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-        except Exception: pass
+
+    def on_done(self, *args):
+        self.running = False
+        full_text = " ".join(self.transcribed_words).strip()
+        if not full_text and self.text_label.get_text() != self.current_live_text:
+            full_text = self.text_label.get_text().strip()
+
+        self.destroy()
+        if full_text:
+            paste_text(full_text + " ")
+            play_sound(SOUND_DONE)
+            subprocess.run(["notify-send", "-u", "low", "-i", "emblem-default", "✨ Dicta Live", full_text])
+        Gtk.main_quit()
+
+    def on_cancel(self, *args):
+        self.running = False
+        self.destroy()
+        Gtk.main_quit()
 
 def main():
-    parser = argparse.ArgumentParser(description="Dicta Linux - Real-Time Bilingual Speech-to-Text & Voice Typing")
-    parser.add_argument("-l", "--lang", default="ar-EG", help="Preferred language (ar-EG, en-US, auto)")
-    parser.add_argument("-c", "--continuous", action="store_true", help="Continuous live dictation mode")
-    parser.add_argument("-f", "--file", help="Transcribe audio file")
-    parser.add_argument("-o", "--save", help="Save transcript to file")
-    parser.add_argument("--stop", action="store_true", help="Stop live dictation")
-    parser.add_argument("--status", action="store_true", help="Check status")
-
-    args = parser.parse_args()
-
-    if args.status:
-        if is_running(): print("Live dictation is active.")
-        else: print("Idle.")
+    if os.path.exists(PID_FILE):
+        # Already open -> Toggle close/done!
+        try:
+            with open(PID_FILE, "r") as f: pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+        except Exception: pass
+        try: os.remove(PID_FILE)
+        except Exception: pass
         return
 
-    if args.stop:
-        if stop_live(): print("Stopped.")
-        else: print("Not running.")
-        return
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
 
-    if args.file:
-        audio_path = os.path.abspath(args.file)
-        with open(audio_path, "rb") as f: data = f.read()
-        text = transcribe_bytes(data, lang=args.lang)
-        print("Transcript:\n", text)
-        if args.save:
-            with open(args.save, "w", encoding="utf-8") as f: f.write(text)
-            print(f"Saved to: {args.save}")
-        return
+    hud = LiveSpeechHUD(lang="ar-EG")
+    
+    def cleanup(*args):
+        if os.path.exists(PID_FILE):
+            try: os.remove(PID_FILE)
+            except Exception: pass
+        Gtk.main_quit()
 
-    live_dictate(lang=args.lang, continuous=args.continuous)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    try:
+        Gtk.main()
+    finally:
+        if os.path.exists(PID_FILE):
+            try: os.remove(PID_FILE)
+            except Exception: pass
 
 if __name__ == "__main__":
     main()
