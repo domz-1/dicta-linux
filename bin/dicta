@@ -21,6 +21,7 @@ import math
 import re
 
 PID_FILE = "/tmp/dicta_live.pid"
+AUDIO_DUMP = "/tmp/dicta_dump.wav"
 SOUND_START = "/usr/share/sounds/freedesktop/stereo/message.oga"
 SOUND_DONE = "/usr/share/sounds/freedesktop/stereo/complete.oga"
 
@@ -31,7 +32,10 @@ WHISPER_MODEL = "/home/adham/whisper.cpp/models/ggml-base.bin"
 
 def play_sound(sound_path):
     if os.path.exists(sound_path):
-        subprocess.Popen(["paplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.Popen(["paplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
 def is_running():
     if os.path.exists(PID_FILE):
@@ -59,7 +63,6 @@ def stop_live():
     return False
 
 def pcm_to_flac(pcm_data, sample_rate=16000):
-    # In-memory WAV
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wf:
         wf.setnchannels(1)
@@ -68,7 +71,6 @@ def pcm_to_flac(pcm_data, sample_rate=16000):
         wf.writeframes(pcm_data)
     wav_bytes = wav_io.getvalue()
 
-    # Convert to FLAC in memory
     p = subprocess.Popen(
         ["ffmpeg", "-loglevel", "quiet", "-f", "wav", "-i", "pipe:0", "-f", "flac", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -129,8 +131,7 @@ def transcribe_whisper(pcm_data):
 def transcribe_bytes(pcm_data, lang="ar-EG"):
     flac_bytes = pcm_to_flac(pcm_data)
     text = ""
-    if flac_bytes and len(flac_bytes) > 1500:
-        # Try primary language (e.g. ar-EG handles Arabic & Franco/mixed English)
+    if flac_bytes and len(flac_bytes) > 1000:
         text = transcribe_google(flac_bytes, lang=lang)
         if not text and lang != "en-US":
             text = transcribe_google(flac_bytes, lang="en-US")
@@ -157,12 +158,11 @@ def paste_text(text):
     subprocess.run(["copyq", "paste"], stderr=subprocess.DEVNULL)
 
 def live_dictate(lang="ar-EG", continuous=False):
-    # Check if already running -> toggle off!
+    # If already running -> user pressed shortcut a 2nd time to force stop & transcribe!
     if is_running():
         stop_live()
         return
 
-    # Write PID
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -170,34 +170,32 @@ def live_dictate(lang="ar-EG", continuous=False):
     subprocess.run([
         "notify-send", "-u", "normal",
         "-i", "audio-input-microphone",
-        "🎙️ Dicta - Live Voice Typing",
-        "Speak naturally in Arabic or English...\n(Auto-detects when you finish speaking)"
+        "🎙️ Dicta - Listening...",
+        "Speak in Arabic or English now!\n(Stops and pastes automatically when you pause)"
     ])
 
-    # Start parec audio stream
     proc = subprocess.Popen(
         ["parec", "--rate=16000", "--channels=1", "--format=s16le"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
 
-    CHUNK_DURATION_MS = 50 # 50ms chunk
-    CHUNK_BYTES = int(16000 * 2 * (CHUNK_DURATION_MS / 1000)) # 1600 bytes
-    SILENCE_LIMIT_FRAMES = int(750 / CHUNK_DURATION_MS) # 0.75s silence triggers auto-paste
-    MAX_RECORD_FRAMES = int(15000 / CHUNK_DURATION_MS) # 15s max per phrase
+    CHUNK_MS = 50
+    CHUNK_BYTES = int(16000 * 2 * (CHUNK_MS / 1000)) # 1600 bytes
+    SILENCE_LIMIT = int(700 / CHUNK_MS) # 0.7s silence
+    MAX_FRAMES = int(18000 / CHUNK_MS)
 
     # Ambient noise calibration
-    ambient_samples = []
-    for _ in range(4): # 200ms
+    ambient = []
+    for _ in range(4):
         raw = proc.stdout.read(CHUNK_BYTES)
         if not raw: break
         count = len(raw) // 2
         shorts = struct.unpack(f"{count}h", raw)
-        rms = int(math.sqrt(sum(s * s for s in shorts) / count))
-        ambient_samples.append(rms)
+        ambient.append(int(math.sqrt(sum(s * s for s in shorts) / count)))
 
-    base_noise = max(50, sum(ambient_samples) // len(ambient_samples) if ambient_samples else 100)
-    SPEECH_THRESHOLD = max(280, int(base_noise * 2.2))
+    base_noise = max(30, sum(ambient) // len(ambient) if ambient else 70)
+    SPEECH_THRESHOLD = max(120, int(base_noise * 1.35))
 
     is_speaking = False
     speech_buffer = bytearray()
@@ -221,38 +219,30 @@ def live_dictate(lang="ar-EG", continuous=False):
                 silence_count = 0
             else:
                 if is_speaking:
-                    speech_buffer.extend(raw) # Include tail of speech
+                    speech_buffer.extend(raw)
                     silence_count += 1
-                    if silence_count >= SILENCE_LIMIT_FRAMES:
-                        # User stopped speaking!
-                        if len(speech_buffer) >= CHUNK_BYTES * 6: # At least 300ms of audio
+                    if silence_count >= SILENCE_LIMIT:
+                        if len(speech_buffer) >= CHUNK_BYTES * 5:
                             text = transcribe_bytes(bytes(speech_buffer), lang=lang)
                             if text:
                                 paste_text(text + " ")
                                 play_sound(SOUND_DONE)
                                 subprocess.run(["notify-send", "-u", "low", "-i", "emblem-default", "✨ Dicta", text])
 
-                        # Reset buffer
                         speech_buffer = bytearray()
                         is_speaking = False
                         silence_count = 0
 
-                        # If single-shot, exit after 1 phrase!
                         if not continuous:
                             break
 
             total_frames += 1
-            if total_frames >= MAX_RECORD_FRAMES and is_speaking:
-                # Max duration hit -> transcribe
+            if total_frames >= MAX_FRAMES and is_speaking:
                 text = transcribe_bytes(bytes(speech_buffer), lang=lang)
                 if text:
                     paste_text(text + " ")
                     play_sound(SOUND_DONE)
-                speech_buffer = bytearray()
-                is_speaking = False
-                silence_count = 0
-                if not continuous:
-                    break
+                break
 
     finally:
         try: proc.terminate()
@@ -285,15 +275,11 @@ def main():
 
     if args.file:
         audio_path = os.path.abspath(args.file)
-        print(f"Transcribing: {audio_path}...")
-        # Read wav
-        with open(audio_path, "rb") as f:
-            data = f.read()
+        with open(audio_path, "rb") as f: data = f.read()
         text = transcribe_bytes(data, lang=args.lang)
         print("Transcript:\n", text)
         if args.save:
-            with open(args.save, "w", encoding="utf-8") as f:
-                f.write(text)
+            with open(args.save, "w", encoding="utf-8") as f: f.write(text)
             print(f"Saved to: {args.save}")
         return
 
