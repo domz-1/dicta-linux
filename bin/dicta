@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dicta Linux - Smart Bilingual Speech-to-Text & Voice Typing for Linux
+Dicta Linux - Smart Real-Time Bilingual Speech-to-Text & Voice Typing
 Author: Adham (@domz-1)
 License: MIT
 """
@@ -14,19 +14,26 @@ import urllib.request
 import urllib.parse
 import json
 import signal
-import tempfile
+import io
+import wave
+import struct
+import math
 import re
 
-PID_FILE = "/tmp/dicta_recording.pid"
-AUDIO_FILE = "/tmp/dicta_audio.wav"
-FLAC_FILE = "/tmp/dicta_audio.flac"
+PID_FILE = "/tmp/dicta_live.pid"
+SOUND_START = "/usr/share/sounds/freedesktop/stereo/message.oga"
+SOUND_DONE = "/usr/share/sounds/freedesktop/stereo/complete.oga"
 
 os.environ["DISPLAY"] = os.environ.get("DISPLAY", ":0")
 
 WHISPER_CLI = "/home/adham/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = "/home/adham/whisper.cpp/models/ggml-base.bin"
 
-def is_recording():
+def play_sound(sound_path):
+    if os.path.exists(sound_path):
+        subprocess.Popen(["paplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def is_running():
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r") as f:
@@ -34,53 +41,40 @@ def is_recording():
             os.kill(pid, 0)
             return pid
         except Exception:
-            try:
-                os.remove(PID_FILE)
-            except Exception:
-                pass
+            try: os.remove(PID_FILE)
+            except Exception: pass
     return None
 
-def start_recording():
-    # Clean previous files
-    for p in [AUDIO_FILE, FLAC_FILE]:
-        if os.path.exists(p):
-            try: os.remove(p)
-            except Exception: pass
-
-    # Use ffmpeg with pulse input (super reliable) or arecord
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "quiet",
-        "-f", "pulse", "-i", "default",
-        "-ar", "16000", "-ac", "1",
-        AUDIO_FILE
-    ]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(PID_FILE, "w") as f:
-            f.write(str(proc.pid))
-        
-        subprocess.run([
-            "notify-send", "-u", "normal",
-            "-i", "audio-input-microphone",
-            "🎙️ Dicta - Recording Started",
-            "Speak now in Arabic or English...\n(Press Alt+D again to finish)"
-        ])
+def stop_live():
+    pid = is_running()
+    if pid:
+        try: os.kill(pid, signal.SIGTERM)
+        except Exception: pass
+        try: os.remove(PID_FILE)
+        except Exception: pass
+        subprocess.run(["pkill", "-f", "parec.*dicta"], stderr=subprocess.DEVNULL)
+        play_sound("/usr/share/sounds/freedesktop/stereo/dialog-information.oga")
+        subprocess.run(["notify-send", "-u", "low", "-i", "audio-volume-muted", "Dicta", "⏹️ Voice typing stopped."])
         return True
-    except Exception as e:
-        subprocess.run(["notify-send", "-u", "critical", "Dicta Error", f"Failed to start microphone: {e}"])
-        return False
+    return False
 
-def stop_recording(pid):
-    try:
-        os.kill(pid, signal.SIGTERM)
-        time.sleep(0.3)
-    except Exception:
-        pass
-    try:
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-    except Exception:
-        pass
+def pcm_to_flac(pcm_data, sample_rate=16000):
+    # In-memory WAV
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+    wav_bytes = wav_io.getvalue()
+
+    # Convert to FLAC in memory
+    p = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "quiet", "-f", "wav", "-i", "pipe:0", "-f", "flac", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    flac_bytes, _ = p.communicate(input=wav_bytes)
+    return flac_bytes
 
 def transcribe_google(flac_bytes, lang="ar-EG"):
     url = f"https://www.google.com/speech-api/v2/recognize?output=json&lang={lang}&client=chromium&key="
@@ -90,7 +84,7 @@ def transcribe_google(flac_bytes, lang="ar-EG"):
         headers={"Content-Type": "audio/x-flac; rate=16000", "User-Agent": "Mozilla/5.0"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=8) as res:
+        with urllib.request.urlopen(req, timeout=6) as res:
             raw = res.read().decode("utf-8")
             lines = [l.strip() for l in raw.split("\n") if l.strip()]
             for line in lines:
@@ -107,52 +101,46 @@ def transcribe_google(flac_bytes, lang="ar-EG"):
         pass
     return ""
 
-def transcribe_whisper(wav_file, lang="auto"):
+def transcribe_whisper(pcm_data):
     if os.path.exists(WHISPER_CLI) and os.path.exists(WHISPER_MODEL):
-        cmd = [
-            WHISPER_CLI,
-            "-m", WHISPER_MODEL,
-            "-f", wav_file,
-            "-l", lang,
-            "--no-timestamps",
-            "-nt"
-        ]
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = tf.name
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(pcm_data)
+        
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+            cmd = [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", wav_path, "-l", "auto", "--no-timestamps", "-nt"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
             lines = res.stdout.strip().splitlines()
-            # Clean whisper output
             text = " ".join(line.strip() for line in lines if line.strip() and not line.startswith("[") and not line.startswith("whisper_"))
-            # Remove repeated bracket timestamps if any
             text = re.sub(r'\[\d+:\d+:\d+\.\d+ --> \d+:\d+:\d+\.\d+\]', '', text).strip()
             return text
         except Exception:
             pass
+        finally:
+            try: os.remove(wav_path)
+            except Exception: pass
     return ""
 
-def transcribe_audio(wav_file, preferred_lang="ar-EG"):
-    # 1. Convert to 16kHz mono FLAC for cloud engine
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "quiet", "-i", wav_file, "-ar", "16000", "-ac", "1", FLAC_FILE])
-    
-    flac_bytes = None
-    if os.path.exists(FLAC_FILE):
-        with open(FLAC_FILE, "rb") as f:
-            flac_bytes = f.read()
-
+def transcribe_bytes(pcm_data, lang="ar-EG"):
+    flac_bytes = pcm_to_flac(pcm_data)
     text = ""
-    # 2. Try Google Cloud engine (first preferred lang, then en fallback)
-    if flac_bytes and len(flac_bytes) > 2000:
-        text = transcribe_google(flac_bytes, lang=preferred_lang)
-        if not text and preferred_lang != "en-US":
+    if flac_bytes and len(flac_bytes) > 1500:
+        # Try primary language (e.g. ar-EG handles Arabic & Franco/mixed English)
+        text = transcribe_google(flac_bytes, lang=lang)
+        if not text and lang != "en-US":
             text = transcribe_google(flac_bytes, lang="en-US")
 
-    # 3. Fallback to local Whisper engine
-    if not text and os.path.exists(wav_file):
-        text = transcribe_whisper(wav_file)
+    if not text:
+        text = transcribe_whisper(pcm_data)
 
     return text.strip()
 
 def paste_text(text):
-    # Copy to clipboard via copyq and xclip
     try:
         p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         p.communicate(input=text.encode("utf-8"))
@@ -165,59 +153,143 @@ def paste_text(text):
         pass
 
     subprocess.run(["copyq", "copy", text], stderr=subprocess.DEVNULL)
-    
-    # Auto-paste in active window
-    time.sleep(0.15)
+    time.sleep(0.08)
     subprocess.run(["copyq", "paste"], stderr=subprocess.DEVNULL)
 
-def toggle_dictate(lang="ar-EG"):
-    pid = is_recording()
-    if pid:
-        # Currently recording -> Stop & Transcribe!
-        subprocess.run(["notify-send", "-u", "normal", "-i", "audio-volume-high", "Dicta", "⏳ Transcribing speech..."])
-        stop_recording(pid)
-        
-        if not os.path.exists(AUDIO_FILE) or os.path.getsize(AUDIO_FILE) < 4000:
-            subprocess.run(["notify-send", "-u", "low", "Dicta", "⚠️ Recording was too short."])
-            return
+def live_dictate(lang="ar-EG", continuous=False):
+    # Check if already running -> toggle off!
+    if is_running():
+        stop_live()
+        return
 
-        text = transcribe_audio(AUDIO_FILE, preferred_lang=lang)
-        if text:
-            paste_text(text)
-            subprocess.run(["notify-send", "-u", "normal", "-i", "emblem-default", "✨ Dicta Transcribed & Pasted!", text])
-            subprocess.run(["copyq", "popup", "✨ Dicta Voice Typing", f"{text}\n(Pasted automatically)"])
-        else:
-            subprocess.run(["notify-send", "-u", "low", "Dicta", "⚠️ Could not recognize speech. Please try again."])
-    else:
-        # Start recording
-        start_recording()
+    # Write PID
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    play_sound(SOUND_START)
+    subprocess.run([
+        "notify-send", "-u", "normal",
+        "-i", "audio-input-microphone",
+        "🎙️ Dicta - Live Voice Typing",
+        "Speak naturally in Arabic or English...\n(Auto-detects when you finish speaking)"
+    ])
+
+    # Start parec audio stream
+    proc = subprocess.Popen(
+        ["parec", "--rate=16000", "--channels=1", "--format=s16le"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+
+    CHUNK_DURATION_MS = 50 # 50ms chunk
+    CHUNK_BYTES = int(16000 * 2 * (CHUNK_DURATION_MS / 1000)) # 1600 bytes
+    SILENCE_LIMIT_FRAMES = int(750 / CHUNK_DURATION_MS) # 0.75s silence triggers auto-paste
+    MAX_RECORD_FRAMES = int(15000 / CHUNK_DURATION_MS) # 15s max per phrase
+
+    # Ambient noise calibration
+    ambient_samples = []
+    for _ in range(4): # 200ms
+        raw = proc.stdout.read(CHUNK_BYTES)
+        if not raw: break
+        count = len(raw) // 2
+        shorts = struct.unpack(f"{count}h", raw)
+        rms = int(math.sqrt(sum(s * s for s in shorts) / count))
+        ambient_samples.append(rms)
+
+    base_noise = max(50, sum(ambient_samples) // len(ambient_samples) if ambient_samples else 100)
+    SPEECH_THRESHOLD = max(280, int(base_noise * 2.2))
+
+    is_speaking = False
+    speech_buffer = bytearray()
+    silence_count = 0
+    total_frames = 0
+
+    try:
+        while os.path.exists(PID_FILE):
+            raw = proc.stdout.read(CHUNK_BYTES)
+            if not raw: break
+
+            count = len(raw) // 2
+            shorts = struct.unpack(f"{count}h", raw)
+            rms = int(math.sqrt(sum(s * s for s in shorts) / count))
+
+            if rms >= SPEECH_THRESHOLD:
+                if not is_speaking:
+                    is_speaking = True
+                    silence_count = 0
+                speech_buffer.extend(raw)
+                silence_count = 0
+            else:
+                if is_speaking:
+                    speech_buffer.extend(raw) # Include tail of speech
+                    silence_count += 1
+                    if silence_count >= SILENCE_LIMIT_FRAMES:
+                        # User stopped speaking!
+                        if len(speech_buffer) >= CHUNK_BYTES * 6: # At least 300ms of audio
+                            text = transcribe_bytes(bytes(speech_buffer), lang=lang)
+                            if text:
+                                paste_text(text + " ")
+                                play_sound(SOUND_DONE)
+                                subprocess.run(["notify-send", "-u", "low", "-i", "emblem-default", "✨ Dicta", text])
+
+                        # Reset buffer
+                        speech_buffer = bytearray()
+                        is_speaking = False
+                        silence_count = 0
+
+                        # If single-shot, exit after 1 phrase!
+                        if not continuous:
+                            break
+
+            total_frames += 1
+            if total_frames >= MAX_RECORD_FRAMES and is_speaking:
+                # Max duration hit -> transcribe
+                text = transcribe_bytes(bytes(speech_buffer), lang=lang)
+                if text:
+                    paste_text(text + " ")
+                    play_sound(SOUND_DONE)
+                speech_buffer = bytearray()
+                is_speaking = False
+                silence_count = 0
+                if not continuous:
+                    break
+
+    finally:
+        try: proc.terminate()
+        except Exception: pass
+        try:
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+        except Exception: pass
 
 def main():
-    parser = argparse.ArgumentParser(description="Dicta Linux - Smart Bilingual Speech-to-Text & Voice Typing")
-    parser.add_argument("-f", "--file", help="Transcribe audio file")
+    parser = argparse.ArgumentParser(description="Dicta Linux - Real-Time Bilingual Speech-to-Text & Voice Typing")
     parser.add_argument("-l", "--lang", default="ar-EG", help="Preferred language (ar-EG, en-US, auto)")
-    parser.add_argument("-o", "--save", help="Save transcription to text file")
-    parser.add_argument("--stop", action="store_true", help="Stop recording")
-    parser.add_argument("--status", action="store_true", help="Check recording status")
+    parser.add_argument("-c", "--continuous", action="store_true", help="Continuous live dictation mode")
+    parser.add_argument("-f", "--file", help="Transcribe audio file")
+    parser.add_argument("-o", "--save", help="Save transcript to file")
+    parser.add_argument("--stop", action="store_true", help="Stop live dictation")
+    parser.add_argument("--status", action="store_true", help="Check status")
 
     args = parser.parse_args()
 
     if args.status:
-        if is_recording(): print("Recording in progress.")
+        if is_running(): print("Live dictation is active.")
         else: print("Idle.")
         return
 
     if args.stop:
-        pid = is_recording()
-        if pid:
-            stop_recording(pid)
-            print("Stopped recording.")
+        if stop_live(): print("Stopped.")
+        else: print("Not running.")
         return
 
     if args.file:
         audio_path = os.path.abspath(args.file)
-        print(f"Transcribing file: {audio_path}...")
-        text = transcribe_audio(audio_path, preferred_lang=args.lang)
+        print(f"Transcribing: {audio_path}...")
+        # Read wav
+        with open(audio_path, "rb") as f:
+            data = f.read()
+        text = transcribe_bytes(data, lang=args.lang)
         print("Transcript:\n", text)
         if args.save:
             with open(args.save, "w", encoding="utf-8") as f:
@@ -225,8 +297,7 @@ def main():
             print(f"Saved to: {args.save}")
         return
 
-    # Default action: Toggle Voice Typing
-    toggle_dictate(lang=args.lang)
+    live_dictate(lang=args.lang, continuous=args.continuous)
 
 if __name__ == "__main__":
     main()
